@@ -1,0 +1,24 @@
+# 触觉仿生手集成系统配置
+
+# 触觉传感器配置
+tactile:
+  sensor_serial: "BM000025"  # 传感器序列号，None 表示自动检测
+  target_fps: 30             # 采集帧率
+  display_heatmap: false     # 是否显示热力图
+
+# 碰撞检测配置
+collision_detection:
+  force_threshold: 5.0       # 触觉力阈值（牛顿）
+  smoothing_window: 3        # 平滑窗口大小
+
+# 手部控制配置
+hand_control:
+  grasp_position: 800        # 抓握位置（0-1000）
+  release_position: 0        # 释放位置（0-1000）
+  control_duration: 500      # 控制持续时间（毫秒）
+  control_speed: 500         # 控制速度
+
+# 监控配置
+monitoring:
+  print_interval: 1.0        # 打印统计信息的间隔（秒）
+  demo_mode: "grasp_release" # 演示模式：grasp_release 或 monitor
