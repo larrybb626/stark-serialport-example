@@ -29,7 +29,7 @@ from revo2_utils import open_modbus_revo2
 config_file = Path(__file__).parent / "config.yaml"
 if not config_file.exists():
     CONFIG = {
-        'collision_detection': {'force_threshold': 60.0, 'smoothing_window': 5},
+        'collision_detection': {'force_threshold': 80.0, 'smoothing_window': 3}, # 窗口稍微调小一点，反应更快
         'tactile': {'target_fps': 30, 'sensor_serial': 'BM000000'},
         'hand_control': {'control_duration': 800},
         'monitoring': {'print_interval': 1.0, 'demo_mode': 'grasp'}
@@ -41,13 +41,14 @@ else:
 
 # ==================== 触觉数据采集模块 ====================
 class TactileDataCollector:
-    """触觉数据采集和处理类 (深度图版)"""
+    """触觉数据采集和处理类 (全图去零 ± 阈值版)"""
 
     def __init__(self, sensor_serial=None):
         self.sensor_serial = sensor_serial
         self.sensor = None
         self.display_img = None
         self.score_history = []
+        self.baseline_score = 0.0
 
     def initialize(self):
         try:
@@ -70,8 +71,10 @@ class TactileDataCollector:
             # 2. 图像处理算法：映射为 0-255 灰度图
             depth_vis = np.clip(raw_depth * 200, 0, 255).astype(np.uint8)
 
-            # 3. 计算“扰动值” (Score = 平均形变体积)
+            # 1. 移除 ROI，使用全图
+            # 2. 改回 Mean：防止极值达到 255 后无法检测到正向增加的压力
             current_score = np.mean(depth_vis)
+
             self.display_img = depth_vis
 
             return {
@@ -96,18 +99,26 @@ class TactileDataCollector:
             self.score_history.pop(0)
 
         smoothed_val = np.mean(self.score_history)
-        return smoothed_val > threshold
+
+        # 【核心修改】：绝对值增量判断。
+        # 等同于 current > base + threshold 或 current < base - threshold
+        return abs(smoothed_val - self.baseline_score) > threshold
 
     def visualize(self):
-        """强制显示深度热力图"""
+        """显示深度热力图 (移除绿框)"""
         if self.display_img is None:
             return True
         try:
             # 应用伪彩色，颜色越红代表受力越深
             display_color = cv2.applyColorMap(self.display_img, cv2.COLORMAP_JET)
 
-            # 实时显示 Score
-            score_text = f"Score(Mean): {np.mean(self.display_img):.1f}"
+            if len(self.score_history) > 0:
+                score = np.mean(self.score_history)
+            else:
+                score = 0.0
+
+            # 移除绿框，只保留左上角的文字状态
+            score_text = f"Score: {score:.1f} (Base: {self.baseline_score:.1f})"
             cv2.putText(display_color, score_text, (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
@@ -146,7 +157,7 @@ class RevoHandController:
 
         # 假设数组顺序为：[小指, 无名指, 中指, 食指, 拇指弯曲, 拇指侧摆]
         # 食指(600) + 拇指弯曲(600) + 拇指侧摆对向食指(1000)，其余为0
-        ok_positions = [450, 800, 500, 0, 0, 0]
+        ok_positions = [600, 700, 450, 0, 0, 0]
 
         try:
             logger.info(f"手指归位，准备捏合...")
@@ -191,12 +202,34 @@ class TactileGraspController:
                 logger.info(">>> [1/3] 正在用 OK 手势抓握物体...")
                 await self.hand.grasp()
 
-                # 2. 监测循环
-                logger.info(">>> [2/3] 进入触觉监测模式，等待 2s 以稳定触觉信号...")
+                # 2. 监测循环前的基准校准 (去零操作)
+                logger.info(">>> [2/3] 进入触觉监测模式，开始 5s 稳定期并提取基准压力值(去零)...")
 
-                await asyncio.sleep(2.0)
+                calibration_scores = []
+                calib_start = time.time()
+
+                # 动态等待2秒，期间持续采集数据和刷新画面
+                t_wait = 5.0
+                while time.time() - calib_start < t_wait:
+                    data = self.tactile.collect_one_frame()
+                    if data is not None:
+                        calibration_scores.append(data['force_val'])
+                        self.tactile.visualize()  # 保持画面不卡顿
+                    await asyncio.sleep(0.01)
+
+                # 计算基准值：截取后半段（后1秒）的数据求平均，避开刚闭合时的微震荡
+                if len(calibration_scores) > 10:
+                    stable_scores = calibration_scores[len(calibration_scores)//2:]
+                    self.tactile.baseline_score = sum(stable_scores) / len(stable_scores)
+                else:
+                    self.tactile.baseline_score = 0.0
+
                 self.tactile.score_history.clear()
-                logger.info(">>> 稳定期结束，正式进入扰动监测状态...")
+
+                th = CONFIG['collision_detection']['force_threshold']
+
+                logger.info(f">>> 稳定期结束！当前静止基准压力值设为: {self.tactile.baseline_score:.1f}")
+                logger.info(f">>> 正式进入扰动监测状态 (触发条件: 偏离基准值超过 ±{th:.1f})...")
 
                 triggered = await self.monitor_collision_loop()
 
@@ -204,6 +237,8 @@ class TactileGraspController:
                 if triggered:
                     logger.warning(">>> [3/3] ⚠️ 检测到强烈扰动！自动释放！")
                     await self.hand.release()
+                    # 释放后清理基准值
+                    self.tactile.baseline_score = 0.0
 
                 logger.info("--- 循环结束，3秒后重试 ---\n")
                 await asyncio.sleep(3.0)
@@ -214,6 +249,8 @@ class TactileGraspController:
 
     async def monitor_collision_loop(self):
         last_print = time.time()
+        th = CONFIG['collision_detection']['force_threshold']
+
         while True:
             data = self.tactile.collect_one_frame()
             if data is None:
@@ -225,7 +262,10 @@ class TactileGraspController:
             # 每秒打印一次日志，避免刷屏
             if time.time() - last_print > 1.0:
                 status = "⚠️ 触发释放" if is_collision else "监测中..."
-                logger.info(f"{status} | 当前Score(Mean): {data['force_val']:.1f} | 阈值: {CONFIG['collision_detection']['force_threshold']}")
+                upper_bound = self.tactile.baseline_score + th
+                lower_bound = max(0, self.tactile.baseline_score - th) # 下限不低于0
+
+                logger.info(f"{status} | 当前: {data['force_val']:.1f} | 基准: {self.tactile.baseline_score:.1f} | 安全区间: [{lower_bound:.1f}, {upper_bound:.1f}]")
                 last_print = time.time()
 
             # 实时渲染图像
@@ -246,14 +286,21 @@ class TactileGraspController:
             is_collision = self.tactile.is_collision_detected(data)
             if not self.tactile.visualize(): break
 
-            sys.stdout.write(f"\r当前形变 Score: {data['force_val']:.1f} | 碰撞状态: {'已超阈值' if is_collision else '安全'}   ")
+            sys.stdout.write(f"\r当前 全图平均 Score: {data['force_val']:.1f} | 碰撞状态: {'已超阈值' if is_collision else '安全'}   ")
             sys.stdout.flush()
             await asyncio.sleep(0.02)
 
     async def cleanup(self):
-        await self.hand.release()
+        # 加入异常捕获，防止多次 cleanup 导致 Modbus 报错
+        try:
+            await self.hand.release()
+        except:
+            pass
         self.tactile.cleanup()
-        libstark.modbus_close(self.hand.client)
+        try:
+            libstark.modbus_close(self.hand.client)
+        except:
+            pass
 
 
 # ==================== 程序入口 ====================
@@ -261,11 +308,12 @@ async def main():
     parser = argparse.ArgumentParser(description='Revo2 触觉抓握演示 (OK 姿势)')
     parser.add_argument('--hand-port', type=str, help='手部串口')
     parser.add_argument('--touch-serial', type=str, default=CONFIG['tactile']['sensor_serial'], help='触觉序列号')
-    parser.add_argument('--force-threshold', type=float, default=5.0, help='触发释放的阈值 (平均像素强度)')
+    # 因为现在取的是 Max 最大值，最高可以是 255，建议默认阈值设高一些
+    parser.add_argument('--force-threshold', type=float, default=CONFIG['collision_detection']['force_threshold'], help='触发释放的阈值 (最大像素强度 0-255)')
     parser.add_argument('--mode', type=str, choices=['grasp', 'monitor'], default='grasp', help='grasp=闭环演示, monitor=仅监测用于定阈值')
 
     args = parser.parse_args()
-    CONFIG['collision_detection']['force_threshold'] = args.force_threshold
+    # CONFIG['collision_detection']['force_threshold'] = args.force_threshold
 
     client, slave_id = await open_modbus_revo2(port_name=args.hand_port)
     hand = RevoHandController(client, slave_id)
