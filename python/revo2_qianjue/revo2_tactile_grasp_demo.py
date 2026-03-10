@@ -1,36 +1,9 @@
 """
-触觉仿生手集成模块 - Revo2 Tactile Grasp Demo
+触觉仿生手集成模块 - Revo2 Tactile Grasp Demo (Depth Version)
 
-本模块实现了一个完整的触觉仿生手控制系统，包含三个主要部分：
-
-1. 数据解码部分：
-   - 同步采集触觉信号（使用触觉模块SDK）
-   - 主要使用 Sensor.OutputType.Force3DTuned
-   - 计算触觉力的合力模值
-
-2. 算法计算-阈值判断：
-   - 监测触觉力是否超过设定阈值
-   - 当超过阈值时，表示物体受到扰动或发生碰撞
-   - 返回布尔变量指示碰撞状态
-
-3. 实时控制：
-   - 手指先摆到抓握姿势
-   - 进入循环监测触觉信号
-   - 当检测到超过阈值的力，自动释放手指
-
-工作流程：
-- 手先摆到抓握姿势（握住物体）
-- 物体受到扰动
-- 触觉模块识别到超过阈值
-- 手自动放开
-
-使用方式：
-    python revo2_tactile_grasp_demo.py [--hand-port PORT] [--touch-serial SERIAL] [--force-threshold THRESHOLD]
-
-参数说明：
-    --hand-port PORT: 手的串口号（如 /dev/ttyUSB0），默认自动检测
-    --touch-serial SERIAL: 触觉传感器序列号（如 BM000026），默认自动检测
-    --force-threshold THRESHOLD: 触觉力阈值（牛顿），默认 5.0
+修改说明：
+1. 触觉源改为 Sensor.OutputType.Depth
+2. 使用图像处理 (Depth -> Grayscale -> Mean Intensity) 来衡量扰动
 """
 
 import asyncio
@@ -58,586 +31,332 @@ from revo2_utils import open_modbus_revo2
 
 # ==================== 加载配置 ====================
 config_file = Path(__file__).parent / "config.yaml"
+# 如果没有配置文件，创建一个默认的字典防止报错
 if not config_file.exists():
-    logger.error(f"配置文件不存在: {config_file}")
-    sys.exit(1)
-
-with open(config_file, 'r', encoding='utf-8') as f:
-    CONFIG = yaml.safe_load(f)
+    CONFIG = {
+        'collision_detection': {'force_threshold': 50.0, 'smoothing_window': 5}, # 注意：阈值现在是像素值(0-255)
+        'tactile': {'target_fps': 30, 'sensor_serial': 'BM000000', 'display_heatmap': True},
+        'hand_control': {'grasp_position': 600, 'release_position': 0, 'control_duration': 500},
+        'monitoring': {'print_interval': 1.0, 'demo_mode': 'grasp_release'}
+    }
+else:
+    with open(config_file, 'r', encoding='utf-8') as f:
+        CONFIG = yaml.safe_load(f)
 
 
 # ==================== 触觉数据采集模块 ====================
 class TactileDataCollector:
-    """触觉数据采集和处理类"""
-    
+    """触觉数据采集和处理类 (深度图版)"""
+
     def __init__(self, sensor_serial=None):
-        """
-        初始化触觉数据采集器
-        
-        Args:
-            sensor_serial (str, optional): 触觉传感器序列号
-        """
         self.sensor_serial = sensor_serial
         self.sensor = None
-        self.force_norm = None  # 保留用于 visualize 和 get_force_statistics
-        self.force_history = []
-        
+        self.display_img = None  # 用于可视化的图像
+        self.score_history = []  # 用于平滑的历史数据
+
     def initialize(self):
         """初始化触觉传感器"""
         try:
             logger.info(f"正在连接触觉传感器: {self.sensor_serial}")
             sensor = Sensor.create(
-                self.sensor_serial, 
+                self.sensor_serial,
                 api=CameraSource.AV_V4L2
             )
-            
+
             if sensor is None:
-                logger.error("触觉传感器初始化失败 - Sensor.create() 返回 None，请检查连接和序列号")
+                logger.error("触觉传感器初始化失败 - Sensor.create() 返回 None")
                 self.sensor = None
                 return False
-            
+
             self.sensor = sensor
-            logger.info("触觉传感器初始化成功")
+            logger.info("触觉传感器初始化成功 (Depth Mode)")
             return True
         except Exception as e:
             logger.error(f"触觉传感器初始化异常: {e}")
             self.sensor = None
             return False
-    
+
     def collect_one_frame(self):
         """
-        采集一帧触觉数据
-        
+        采集一帧触觉深度数据并处理
+
         Returns:
-            dict: 包含触觉数据的字典，包括 force_3d_tuned, force_norm 等
+            dict: 包含触觉评分的字典
         """
         if not self.sensor:
             return None
-        
+
         try:
-            # 采集 Force3DTuned 数据
-            depth,force_3d_tuned = self.sensor.selectSensorInfo(
-                Sensor.OutputType.Depth,
-                Sensor.OutputType.Force3DTuned
+            # 1. 采集深度数据 (Depth)
+            # 原始 depth 数据通常是 float 或 int，代表距离/变形量
+            raw_depth = self.sensor.selectSensorInfo(
+                Sensor.OutputType.Depth
             )
 
-            if force_3d_tuned is None:
+            if raw_depth is None:
                 return None
-            
-            # 计算触觉力的合力（矩阵的模长）
-            # force_3d_tuned 的形状为 (height, width, 3)
-            force_norm = np.linalg.norm(force_3d_tuned, axis=2)  # (height, width)
-            
-            # 取最大值作为该帧的触觉强度
-            max_force = np.max(force_norm)
-            mean_force = np.mean(force_norm)
-            
-            # 保存 force_norm 用于可视化
-            self.force_norm = force_norm
-            
+
+            # 2. 图像处理算法 (User Provided Logic)
+            # 将深度数据映射到 0-255 的可视区间
+            # clip 限制范围，然后转为 uint8 格式
+            depth_vis = np.clip(raw_depth * 200, 0, 255).astype(np.uint8)
+
+            # 3. 计算“扰动值” (Disturbance Score)
+            # 使用图像的 平均像素强度 (Mean Intensity) 作为衡量受力大小的标准
+            # 当手抓握物体受力时，凝胶变形，像素值总体会升高
+            current_score = np.mean(depth_vis)
+            max_score = np.max(depth_vis)
+
+            # 保存用于可视化
+            self.display_img = depth_vis
+
             return {
-                'force_3d_tuned': force_3d_tuned,
-                'force_norm': force_norm,
-                'max_force': float(max_force),
-                'mean_force': float(mean_force),
+                'raw_depth': raw_depth,
+                'depth_vis': depth_vis,
+                'force_val': float(current_score), # 这里为了兼容旧接口，key依然叫 force_val
+                'max_val': float(max_score),
                 'timestamp': time.time()
             }
-        
+
         except Exception as e:
             logger.error(f"采集触觉数据异常: {e}")
             return None
-    
+
     def is_collision_detected(self, current_data, threshold=None):
         """
-        检测是否发生碰撞（触觉力超过阈值）
-        
-        Args:
-            current_data (dict): 当前帧的触觉数据
-            threshold (float, optional): 阈值，如果为None则使用全局配置
-            
-        Returns:
-            bool: 是否检测到碰撞
+        检测是否发生碰撞/扰动
         """
         if threshold is None:
             threshold = CONFIG['collision_detection']['force_threshold']
-        
+
         if current_data is None:
             return False
-        
-        max_force = current_data['max_force']
-        
-        # 更新历史数据用于平滑
-        self.force_history.append(max_force)
-        if len(self.force_history) > CONFIG['collision_detection']['smoothing_window']:
-            self.force_history.pop(0)
-        
-        # 使用移动平均来平滑噪声
-        smoothed_force = np.mean(self.force_history)
-        
-        return smoothed_force > threshold
-    
-    def get_force_statistics(self):
-        """获取触觉力统计信息"""
-        if not self.force_norm:
+
+        # 获取当前帧的“受力分数” (即平均深度像素值)
+        current_val = current_data['force_val']
+
+        # 更新历史数据用于平滑 (防止单帧噪点导致的误触)
+        self.score_history.append(current_val)
+        if len(self.score_history) > CONFIG['collision_detection']['smoothing_window']:
+            self.score_history.pop(0)
+
+        # 使用移动平均值与阈值比较
+        smoothed_val = np.mean(self.score_history)
+
+        return smoothed_val > threshold
+
+    def get_statistics(self):
+        """获取统计信息"""
+        if self.display_img is None:
             return None
-        
         return {
-            'max': float(np.max(self.force_norm)),
-            'mean': float(np.mean(self.force_norm)),
-            'std': float(np.std(self.force_norm))
+            'mean': float(np.mean(self.display_img)),
+            'max': float(np.max(self.display_img)),
+            'std': float(np.std(self.display_img))
         }
-    
+
     def visualize(self):
-        """显示触觉力热力图（可选）"""
-        if not CONFIG['tactile']['display_heatmap'] or self.force_norm is None:
-            return
-        
+        """显示深度图"""
+        if not CONFIG['tactile']['display_heatmap'] or self.display_img is None:
+            return True
+
         try:
-            # 归一化显示
-            display = (self.force_norm / np.max(self.force_norm) * 255).astype(np.uint8)
-            display_color = cv2.applyColorMap(display, cv2.COLORMAP_JET)
-            
-            cv2.imshow("Tactile Force Heatmap", display_color)
-            
+            # 应用伪彩色，让深度图看起来更直观 (Blue -> Red)
+            display_color = cv2.applyColorMap(self.display_img, cv2.COLORMAP_JET)
+
+            # 在图像上显示当前数值
+            cv2.putText(display_color, f"Score: {np.mean(self.display_img):.1f}",
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            cv2.imshow("Tactile Depth Stream", display_color)
+
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 return False
         except Exception as e:
             logger.debug(f"可视化异常: {e}")
-        
+
         return True
-    
+
     def cleanup(self):
-        """清理资源"""
         if self.sensor is not None:
             try:
                 self.sensor.release()
-                logger.info("触觉传感器资源已释放")
-            except Exception as e:
-                logger.debug(f"释放触觉传感器异常: {e}")
-            finally:
-                self.sensor = None
-        
-        try:
-            cv2.destroyAllWindows()
-        except:
-            pass
+            except:
+                pass
+            self.sensor = None
+        cv2.destroyAllWindows()
 
 
-# ==================== 手部控制模块 ====================
+# ==================== 手部控制模块 (保持不变) ====================
 class RevoHandController:
-    """Revo2手部控制类"""
-    
     def __init__(self, client, slave_id):
-        """
-        初始化手部控制器
-        
-        Args:
-            client: Modbus客户端
-            slave_id: 设备ID
-        """
         self.client = client
         self.slave_id = slave_id
-        self.current_positions = [0] * 6
-        
+
     async def initialize(self):
-        """初始化手部配置"""
         try:
-            # 设置为归一化模式
-            await self.client.set_finger_unit_mode(
-                self.slave_id, 
-                libstark.FingerUnitMode.Normalized
-            )
-            logger.info("手部控制模式已设置为归一化模式")
+            await self.client.set_finger_unit_mode(self.slave_id, libstark.FingerUnitMode.Normalized)
             return True
         except Exception as e:
             logger.error(f"手部初始化异常: {e}")
             return False
-    
+
     async def grasp(self, position=None, duration=None):
-        """
-        执行抓握动作
-        
-        Args:
-            position (int, optional): 目标位置（0-1000），默认使用配置值
-            duration (int, optional): 持续时间（毫秒），默认使用配置值
-        """
-        if position is None:
-            position = CONFIG['hand_control']['grasp_position']
-        if duration is None:
-            duration = CONFIG['hand_control']['control_duration']
-        
+        pos = position if position is not None else CONFIG['hand_control']['grasp_position']
+        dur = duration if duration is not None else CONFIG['hand_control']['control_duration']
         try:
-            positions = [position] * 6
-            durations = [duration] * 6
-            
-            logger.info(f"执行抓握动作: 位置={position}, 时间={duration}ms")
-            await self.client.set_finger_positions_and_durations(
-                self.slave_id, positions, durations
-            )
-            self.current_positions = positions
-            
-            # 等待手指到达目标位置
-            await asyncio.sleep(duration / 1000.0 + 0.2)
-            
+            await self.client.set_finger_positions_and_durations(self.slave_id, [pos]*6, [dur]*6)
+            await asyncio.sleep(dur / 1000.0 + 0.5) # 稍微多等一点时间确保抓稳
         except Exception as e:
-            logger.error(f"抓握动作执行异常: {e}")
-    
+            logger.error(f"抓握异常: {e}")
+
     async def release(self, duration=None):
-        """
-        执行释放动作
-        
-        Args:
-            duration (int, optional): 持续时间（毫秒），默认使用配置值
-        """
-        if duration is None:
-            duration = CONFIG['hand_control']['control_duration']
-        
+        pos = CONFIG['hand_control']['release_position']
+        dur = duration if duration is not None else CONFIG['hand_control']['control_duration']
         try:
-            positions = [CONFIG['hand_control']['release_position']] * 6
-            durations = [duration] * 6
-            
-            logger.info(f"执行释放动作: 时间={duration}ms")
-            await self.client.set_finger_positions_and_durations(
-                self.slave_id, positions, durations
-            )
-            self.current_positions = positions
-            
-            # 等待手指释放
-            await asyncio.sleep(duration / 1000.0 + 0.2)
-            
+            await self.client.set_finger_positions_and_durations(self.slave_id, [pos]*6, [dur]*6)
+            await asyncio.sleep(dur / 1000.0 + 0.2)
         except Exception as e:
-            logger.error(f"释放动作执行异常: {e}")
-    
-    async def get_motor_status(self):
-        """获取马达状态"""
-        try:
-            status = await self.client.get_motor_status(self.slave_id)
-            return status
-        except Exception as e:
-            logger.error(f"获取马达状态异常: {e}")
-            return None
+            logger.error(f"释放异常: {e}")
 
 
-# ==================== 主控制循环 ====================
+# ==================== 主逻辑控制器 ====================
 class TactileGraspController:
-    """触觉抓握控制器 - 整合触觉和手控制"""
-    
     def __init__(self, hand_controller, tactile_collector):
-        """
-        初始化触觉抓握控制器
-        
-        Args:
-            hand_controller (RevoHandController): 手部控制器
-            tactile_collector (TactileDataCollector): 触觉数据采集器
-        """
         self.hand = hand_controller
         self.tactile = tactile_collector
         self.is_grasping = False
-        self.collision_detected = False
-        self.stats = {
-            'frame_count': 0,
-            'collision_count': 0,
-            'start_time': time.time()
-        }
-        
+
     async def run_grasp_release_demo(self):
-        """
-        运行抓握-释放演示
-        
-        流程：
-        1. 手执行抓握动作
-        2. 持续监测触觉信号
-        3. 当检测到超过阈值的触觉力时，自动释放
-        4. 重复循环
-        """
-        logger.info("=" * 60)
-        logger.info("启动触觉抓握-释放演示")
-        logger.info("=" * 60)
-        
+        """核心流程：抓握 -> 监测扰动 -> 释放"""
+        logger.info(">>> 启动触觉抓握闭环演示")
+
         try:
             while True:
-                # 1. 抓握
-                logger.info("\n[步骤1] 执行抓握...")
+                # 1. 初始状态：手张开 (确保归位)
+                logger.info("准备中...")
+                await self.hand.release()
+                await asyncio.sleep(1.0)
+
+                # 2. 执行抓握
+                logger.info(">>> [1/3] 正在抓握物体...")
                 await self.hand.grasp()
                 self.is_grasping = True
-                logger.info("✓ 抓握完成，开始监测触觉信号...")
-                
-                # 2. 监测阶段
-                await self.monitor_and_release()
-                
-                # 3. 等待后重新开始
-                logger.info("\n等待3秒后重新开始循环...\n")
+                logger.info("    抓握完成，建立基准...")
+
+                # 可选：这里可以加一个逻辑，读取抓握后的“基准值”，
+                # 然后阈值设为 基准值 + 增量 (自适应阈值)，目前先用固定阈值
+
+                # 3. 监测循环
+                logger.info(">>> [2/3] 进入触觉监测模式 (等待扰动)...")
+                triggered = await self.monitor_collision_loop()
+
+                # 4. 触发释放
+                if triggered:
+                    logger.warning(">>> [3/3] 检测到扰动！立即释放！")
+                    await self.hand.release()
+                    self.is_grasping = False
+
+                logger.info("--- 循环结束，3秒后重试 ---\n")
                 await asyncio.sleep(3.0)
-                
+
         except KeyboardInterrupt:
-            logger.info("\n用户中断程序")
-        except Exception as e:
-            logger.error(f"演示循环异常: {e}")
+            logger.info("用户停止演示")
         finally:
             await self.cleanup()
-    
-    async def monitor_and_release(self, monitor_timeout=30.0):
-        """
-        监测触觉信号并在碰撞时释放
-        
-        Args:
-            monitor_timeout (float): 监测超时时间（秒）
-        """
-        start_time = time.time()
-        last_print = start_time
+
+    async def monitor_collision_loop(self):
+        """循环检测，直到超过阈值返回 True"""
         frame_count = 0
-        
-        while time.time() - start_time < monitor_timeout:
-            # 采集触觉数据
-            tactile_data = self.tactile.collect_one_frame()
-            if tactile_data is None:
+        last_print = time.time()
+
+        while True:
+            # 采集数据
+            data = self.tactile.collect_one_frame()
+            if data is None:
                 await asyncio.sleep(0.01)
                 continue
-            
-            frame_count += 1
-            self.stats['frame_count'] += 1
-            
-            # 检测碰撞
-            is_collision = self.tactile.is_collision_detected(
-                tactile_data, 
-                CONFIG['collision_detection']['force_threshold']
-            )
-            
-            # 打印统计信息
-            current_time = time.time()
-            if current_time - last_print >= CONFIG['monitoring']['print_interval']:
-                fps = frame_count / (current_time - start_time) if (current_time - start_time) > 0 else 0
-                stats = self.tactile.get_force_statistics()
-                
-                status_str = "⚠️  碰撞检测!" if is_collision else "✓ 正常监测"
-                
-                logger.info(
-                    f"{status_str} | FPS: {fps:.1f} | "
-                    f"力值: max={stats['max']:.2f}N, mean={stats['mean']:.2f}N, "
-                    f"阈值={CONFIG['collision_detection']['force_threshold']}N"
-                )
-                
-                last_print = current_time
-            
-            # 触觉可视化
+
+            # 判断碰撞
+            # 注意：阈值现在是 0-255 的数值
+            # 建议先用 monitor 模式看一下正常抓握时的数值是多少，比如正常抓是40，受力是80，那阈值设60
+            is_collision = self.tactile.is_collision_detected(data)
+
+            # 打印状态
+            if time.time() - last_print > 1.0:
+                stats = self.tactile.get_statistics()
+                status = "⚠️ 触发释放" if is_collision else "监测中..."
+                logger.info(f"{status} | 当前Score(Mean): {stats['mean']:.1f} | 阈值: {CONFIG['collision_detection']['force_threshold']}")
+                last_print = time.time()
+
+            # 可视化
             if not self.tactile.visualize():
-                break
-            
-            # 碰撞检测 - 释放
+                return False
+
             if is_collision:
-                logger.warning("\n⚠️  检测到超过阈值的触觉力，执行释放...")
-                self.stats['collision_count'] += 1
-                await self.hand.release()
-                self.is_grasping = False
-                logger.info("✓ 释放完成")
-                break
-            
-            # 控制帧率
-            await asyncio.sleep(1.0 / CONFIG['tactile']['target_fps'])
-    
+                return True
+
+            await asyncio.sleep(0.01)
+
     async def run_monitor_only(self):
-        """
-        运行纯监测模式（不执行抓握释放）
-        
-        用途：验证触觉传感器和阈值设置
-        """
-        logger.info("=" * 60)
-        logger.info("启动触觉监测模式（仅监测，不控制手）")
-        logger.info("=" * 60)
-        
-        try:
-            last_print = time.time()
-            frame_count = 0
-            
-            while True:
-                tactile_data = self.tactile.collect_one_frame()
-                if tactile_data is None:
-                    await asyncio.sleep(0.01)
-                    continue
-                
-                frame_count += 1
-                self.stats['frame_count'] += 1
-                
-                is_collision = self.tactile.is_collision_detected(
-                    tactile_data,
-                    CONFIG['collision_detection']['force_threshold']
-                )
-                
-                current_time = time.time()
-                if current_time - last_print >= CONFIG['monitoring']['print_interval']:
-                    fps = frame_count / (current_time - last_print)
-                    stats = self.tactile.get_force_statistics()
-                    
-                    status_str = "⚠️  碰撞检测!" if is_collision else "✓ 正常"
-                    
-                    logger.info(
-                        f"{status_str} | FPS: {fps:.1f} | "
-                        f"力值: max={stats['max']:.2f}N, "
-                        f"mean={stats['mean']:.2f}N"
-                    )
-                    
-                    frame_count = 0
-                    last_print = current_time
-                
-                if not self.tactile.visualize():
-                    break
-                
-                await asyncio.sleep(1.0 / CONFIG['tactile']['target_fps'])
-                
-        except KeyboardInterrupt:
-            logger.info("\n用户中断监测")
-        except Exception as e:
-            logger.error(f"监测异常: {e}")
-        finally:
-            await self.cleanup()
-    
+        """仅监测模式：用于调试阈值"""
+        logger.info(">>> 启动纯监测模式 (用于校准阈值)")
+        logger.info("请观察'当前Score'的变化，以此来设定合适的 --force-threshold")
+
+        while True:
+            data = self.tactile.collect_one_frame()
+            if data is None: continue
+
+            is_collision = self.tactile.is_collision_detected(data)
+
+            if not self.tactile.visualize(): break
+
+            # 实时打印比较频繁，便于观察数值跳变
+            sys.stdout.write(f"\rScore: {data['force_val']:.1f} | Max: {data['max_val']:.0f} | 碰撞: {'YES' if is_collision else 'NO '}   ")
+            sys.stdout.flush()
+
+            await asyncio.sleep(0.02)
+
     async def cleanup(self):
-        """清理资源"""
-        logger.info("\n" + "=" * 60)
-        logger.info("资源清理中...")
-        
-        # 释放手指
-        if self.is_grasping:
-            try:
-                await self.hand.release(duration=200)
-            except:
-                pass
-        
-        # 释放触觉传感器
+        await self.hand.release()
         self.tactile.cleanup()
-        
-        # 关闭Modbus连接
-        try:
-            libstark.modbus_close(self.hand.client)
-            logger.info("Modbus连接已关闭")
-        except:
-            pass
-        
-        logger.info("=" * 60)
-        logger.info("程序结束")
-        logger.info(f"总帧数: {self.stats['frame_count']}")
-        logger.info(f"碰撞次数: {self.stats['collision_count']}")
-        logger.info("=" * 60)
+        libstark.modbus_close(self.hand.client)
 
 
-# ==================== 主函数 ====================
+# ==================== 程序入口 ====================
 async def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(
-        description='触觉仿生手集成演示',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例：
-  # 自动检测，使用默认参数
-  python revo2_tactile_grasp_demo.py
-  
-  # 指定手的串口和触觉传感器序列号
-  python revo2_tactile_grasp_demo.py --hand-port /dev/ttyUSB0 --touch-serial BM000026
-  
-  # 仅监测模式（不执行抓握）
-  python revo2_tactile_grasp_demo.py --mode monitor
-  
-  # 设置自定义阈值
-  python revo2_tactile_grasp_demo.py --force-threshold 8.0
-        """
-    )
-    
-    parser.add_argument(
-        '--hand-port',
-        type=str,
-        default=None,
-        help='手的串口号（如 /dev/ttyUSB0），默认自动检测'
-    )
-    parser.add_argument(
-        '--touch-serial',
-        type=str,
-        default=CONFIG['tactile']['sensor_serial'],
-        help=f"触觉传感器序列号（如 BM000026），默认 {CONFIG['tactile']['sensor_serial']}"
-    )
-    parser.add_argument(
-        '--force-threshold',
-        type=float,
-        default=CONFIG['collision_detection']['force_threshold'],
-        help=f"触觉力阈值（牛顿），默认 {CONFIG['collision_detection']['force_threshold']}"
-    )
-    parser.add_argument(
-        '--mode',
-        type=str,
-        choices=['grasp_release', 'monitor'],
-        default=CONFIG['monitoring']['demo_mode'],
-        help=f"运行模式，默认为 {CONFIG['monitoring']['demo_mode']} 模式"
-    )
-    parser.add_argument(
-        '--display-tactile',
-        action='store_true',
-        default=CONFIG['tactile']['display_heatmap'],
-        help='显示触觉热力图'
-    )
-    parser.add_argument(
-        '--grasp-position',
-        type=int,
-        default=CONFIG['hand_control']['grasp_position'],
-        help=f"抓握位置（0-1000），默认 {CONFIG['hand_control']['grasp_position']}"
-    )
-    
+    parser = argparse.ArgumentParser(description='Revo2 触觉抓握演示 (深度图版)')
+    parser.add_argument('--hand-port', type=str, help='手部串口')
+    parser.add_argument('--touch-serial', type=str, default=CONFIG['tactile']['sensor_serial'], help='触觉序列号')
+    # 注意：这里的默认阈值改大了，因为像素和之和可能比较大，或者均值在0-255之间
+    parser.add_argument('--force-threshold', type=float, default=5.0, help='触发释放的阈值 (0-255之间, 建议先用monitor测一下)')
+    parser.add_argument('--mode', type=str, choices=['grasp', 'monitor'], default='grasp', help='grasp=抓握演示, monitor=仅看数据')
+
     args = parser.parse_args()
-    
-    # 根据命令行参数更新配置
-    if args.force_threshold != CONFIG['collision_detection']['force_threshold']:
-        CONFIG['collision_detection']['force_threshold'] = args.force_threshold
-    if args.display_tactile:
-        CONFIG['tactile']['display_heatmap'] = True
-    if args.grasp_position != CONFIG['hand_control']['grasp_position']:
-        CONFIG['hand_control']['grasp_position'] = args.grasp_position
-    if args.mode != CONFIG['monitoring']['demo_mode']:
-        CONFIG['monitoring']['demo_mode'] = args.mode
-    
+
+    # 更新配置
+    CONFIG['collision_detection']['force_threshold'] = args.force_threshold
+
+    # 初始化
+    client, slave_id = await open_modbus_revo2(port_name=args.hand_port)
+    hand = RevoHandController(client, slave_id)
+    await hand.initialize()
+
+    tactile = TactileDataCollector(args.touch_serial)
+    if not tactile.initialize():
+        sys.exit(1)
+
+    controller = TactileGraspController(hand, tactile)
+
     try:
-        # 1. 初始化手部控制
-        logger.info("=" * 60)
-        logger.info("初始化手部控制...")
-        logger.info("=" * 60)
-        
-        client, slave_id = await open_modbus_revo2(port_name=args.hand_port)
-        hand_controller = RevoHandController(client, slave_id)
-        
-        if not await hand_controller.initialize():
-            logger.error("手部初始化失败")
-            sys.exit(1)
-        
-        # 2. 初始化触觉采集
-        logger.info("\n" + "=" * 60)
-        logger.info("初始化触觉采集...")
-        logger.info("=" * 60)
-        
-        tactile_collector = TactileDataCollector(sensor_serial=args.touch_serial)
-        
-        if not tactile_collector.initialize():
-            logger.error("触觉采集初始化失败")
-            tactile_collector.cleanup()
-            libstark.modbus_close(client)
-            sys.exit(1)
-        
-        # 3. 创建控制器并运行
-        logger.info("\n" + "=" * 60)
-        logger.info("初始化完成，启动主程序...")
-        logger.info("=" * 60)
-        
-        controller = TactileGraspController(hand_controller, tactile_collector)
-        
         if args.mode == 'monitor':
             await controller.run_monitor_only()
         else:
             await controller.run_grasp_release_demo()
-        
-    except KeyboardInterrupt:
-        logger.info("\n程序被用户中断")
-        sys.exit(0)
     except Exception as e:
-        logger.error(f"程序异常: {e}", exc_info=True)
-        sys.exit(1)
-
+        logger.error(f"运行出错: {e}")
+        await controller.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())
