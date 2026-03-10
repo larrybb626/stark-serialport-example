@@ -116,10 +116,11 @@ class TactileDataCollector:
         
         try:
             # 采集 Force3DTuned 数据
-            force_3d_tuned = self.sensor.selectSensorInfo(
+            depth,force_3d_tuned = self.sensor.selectSensorInfo(
+                Sensor.OutputType.Depth,
                 Sensor.OutputType.Force3DTuned
             )
-            
+
             if force_3d_tuned is None:
                 return None
             
