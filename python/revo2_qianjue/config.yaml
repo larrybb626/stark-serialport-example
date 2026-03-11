@@ -8,7 +8,7 @@ tactile:
 
 # 碰撞检测配置
 collision_detection:
-  force_threshold: 0.2       # 触觉力阈值（牛顿）
+  force_threshold: 1.0       # 触觉力阈值（牛顿）
   smoothing_window: 3        # 平滑窗口大小
 
 # 手部控制配置
@@ -22,3 +22,13 @@ hand_control:
 monitoring:
   print_interval: 1.0        # 打印统计信息的间隔（秒）
   demo_mode: "grasp_release" # 演示模式：grasp_release 或 monitor
+
+# 机械臂联动配置
+arm_control:
+  arm_ip: "192.168.1.18"      # 机械臂IP地址
+  arm_port: 8080              # 控制端口
+  forward_distance: 0.20      # 前进冲锋的距离 (单位：米，0.10 = 10cm)
+  retreat_distance: 0.10      # 触发后退的距离 (单位：米)
+  forward_speed: 5           # 前进速度 (百分比 1-100，建议慢一点)
+  retreat_speed: 20           # 避险后退速度 (百分比 1-100，建议快一点)
+  return_speed: 20            # 回归原点速度 (百分比 1-100)

@@ -15,6 +15,27 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_imports import logger, libstark
 
+# ==================== 日志简洁化配置 ====================
+import logging
+import os
+class ConciseFormatter(logging.Formatter):
+    """自定义格式化器：将绝对路径简化为 ~/ 或 仅文件名"""
+    def format(self, record):
+        # home = os.path.expanduser("~")
+        # 如果路径在用户目录下，替换为 ~
+        # if record.pathname.startswith(home):
+        #     record.concise_path = record.pathname.replace(home, "~", 1)
+        # else:
+        #     # 否则只显示最后的文件名
+        record.concise_path = os.path.basename(record.pathname)
+        return super().format(record)
+
+for handler in logger.handlers:
+    # 定义简洁的格式：时间 [等级] [路径:行号] 消息
+    new_fmt = '%(asctime)s [%(levelname)s] [%(concise_path)s:%(lineno)d] %(message)s'
+    handler.setFormatter(ConciseFormatter(new_fmt))
+# ===================================================
+
 try:
     from xensesdk import Sensor
     from xensesdk.xenseInterface.sensorEnum import CameraSource
