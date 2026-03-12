@@ -183,8 +183,8 @@ class RevoHandController:
         try:
             logger.info(f"手指归位，准备捏合...")
             # 先全部张开作为预备动作
-            await self.client.set_finger_positions_and_durations(self.slave_id, [0]*6, [dur]*6)
-            await asyncio.sleep(dur / 1000.0 + 0.2)
+            # await self.client.set_finger_positions_and_durations(self.slave_id, [0]*6, [dur]*6)
+            # await asyncio.sleep(dur / 1000.0 + 0.2)
 
             logger.info(f"执行 OK 抓握姿势: {ok_positions}")
             await self.client.set_finger_positions_and_durations(self.slave_id, ok_positions, durations)
@@ -216,7 +216,7 @@ class TactileGraspController:
         logger.info(">>> 启动触觉抓握闭环演示")
         try:
             while True:
-                await self.hand.release()
+                # await self.hand.release()
                 await asyncio.sleep(1.0)
 
                 # 1. 执行OK抓握
@@ -257,7 +257,7 @@ class TactileGraspController:
                 # 3. 触发释放
                 if triggered:
                     logger.warning(">>> [3/3] ⚠️ 检测到强烈扰动！自动释放！")
-                    await self.hand.release()
+                    # await self.hand.release()
                     # 释放后清理基准值
                     self.tactile.baseline_score = 0.0
 
@@ -313,10 +313,10 @@ class TactileGraspController:
 
     async def cleanup(self):
         # 加入异常捕获，防止多次 cleanup 导致 Modbus 报错
-        try:
-            await self.hand.release()
-        except:
-            pass
+        # try:
+        #     await self.hand.release()
+        # except:
+        #     pass
         self.tactile.cleanup()
         try:
             libstark.modbus_close(self.hand.client)

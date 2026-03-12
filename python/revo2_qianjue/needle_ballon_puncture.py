@@ -62,17 +62,25 @@ class ArmController:
         else:
             self.connected = True
             logger.info(f"✅ 成功连接机械臂: {clean_ip}，ID: {self.handle.id}")
-            # 记录当前手动设置的位置作为“初始高空安全点”
-            self.record_home_position()
+            # 🌟 新逻辑：加载配置文件中的绝对原点
+            self.setup_home_position()
 
-    def record_home_position(self):
-        """记录当前的关节角度作为初始 Home 点"""
-        ret, state = self.arm.rm_get_current_arm_state()
-        if ret == 0:
-            self.home_joint = state['joint']
-            logger.info(f"🏠 已成功锁定当前姿态为初始原点")
+    def setup_home_position(self):
+        """设定安全的初始原点位置"""
+        arm_cfg = CONFIG.get('arm_control', {})
+        home_angles = arm_cfg.get('home_joint_angles', None)
+
+        if home_angles and len(home_angles) == 6:
+            self.home_joint = home_angles
+            logger.info(f"🏠 已加载配置文件中的固定安全原点 (Joints): {[round(j, 3) for j in self.home_joint]}")
         else:
-            logger.error(f"❌ 记录初始位置失败，错误码: {ret}")
+            # 兼容处理：如果没有配置，则像以前一样记录当前位置
+            ret, state = self.arm.rm_get_current_arm_state()
+            if ret == 0:
+                self.home_joint = state['joint']
+                logger.info(f"🏠 配置文件未指定角度，已锁定当前随意位置为原点 (Joints): {[round(j, 3) for j in self.home_joint]}")
+            else:
+                logger.error(f"❌ 记录初始位置失败，错误码: {ret}")
 
     async def return_to_home(self):
         """让机械臂安全返回记录的初始位置"""
@@ -80,11 +88,13 @@ class ArmController:
 
         # 动态读取 YAML 中的回零速度配置，默认 20
         speed = CONFIG.get('arm_control', {}).get('return_speed', 20)
-
-        logger.info(f"🔄 机械臂正在平稳返回初始原点 (速度: {speed}%)...")
+        logger.info(f"🔄 机械臂正在平稳返回固定初始原点 (速度: {speed}%)...")
+        # rm_movej 用于回到指定的各个关节角度，这能保证机械臂不仅位置对，而且连手肘的姿态也和原来一模一样
         ret = await asyncio.to_thread(self.arm.rm_movej, self.home_joint, speed, 0, 0, 1)
         if ret == 0:
-            logger.info("✅ 已安全回到初始原点！")
+            logger.info("✅ 已安全回到绝对初始原点！")
+        else:
+            logger.error(f"❌ 返回原点失败，错误码: {ret}")
 
     async def move_forward_async(self, distance, speed):
         """水平向前移动 (异步非阻塞)"""
@@ -164,72 +174,70 @@ class IntegratedGraspController(TactileGraspController):
         ret_dist = arm_cfg.get('retreat_distance', 0.10)
         ret_spd = arm_cfg.get('retreat_speed', 50)
 
+        # 1. 第一步：高空抓握针头
+        logger.info(">>> [初始化] 正在用 OK 手势抓牢针头...")
+        await self.hand.grasp()
+        await asyncio.sleep(1)
+
         try:
-            while True:
-                # 0. 确保手是松开的，并退回到安全高空
-                await self.hand.release()
-                await self.arm.return_to_home()
-                await asyncio.sleep(1.0)
+            # while True:
+            # 0. 确保手是松开的，并退回到安全高空
+            # await self.hand.release()
+            await self.arm.return_to_home()
+            await asyncio.sleep(1.0)
 
-                # 1. 第一步：高空抓握针头
-                logger.info(">>> [1/5] 正在用 OK 手势抓握针头...")
-                await self.hand.grasp()
-                await asyncio.sleep(0.5)
+            # 2. 第二步：发送前进指令 (调用 YAML 配置的距离和速度)
+            logger.info(">>> [2/5] 机械臂开始向前推进...")
+            await self.arm.move_forward_async(distance=fwd_dist, speed=fwd_spd)
 
-                # 2. 第二步：发送前进指令 (调用 YAML 配置的距离和速度)
-                logger.info(">>> [2/5] 机械臂开始向前推进...")
-                await self.arm.move_forward_async(distance=fwd_dist, speed=fwd_spd)
+            # 3. 第三步：在行进中过滤启动震动，提取基准
+            logger.info(">>> [3/5] 进入运动校准期(3.5秒)：忽略启动震动，提取平稳前进基准...")
+            calibration_scores = []
+            calib_start = time.time()
 
-                # 3. 第三步：在行进中过滤启动震动，提取基准
-                logger.info(">>> [3/5] 进入运动校准期(3.5秒)：忽略启动震动，提取平稳前进基准...")
-                calibration_scores = []
-                calib_start = time.time()
+            while time.time() - calib_start < 2:
+                data = self.tactile.collect_one_frame()
+                if data is not None:
+                    # 前 1 秒机械臂刚启动时的震动数据被丢弃，只取后 1 秒的平滑数据
+                    if time.time() - calib_start > 1:
+                        calibration_scores.append(data['force_val'])
+                    self.tactile.visualize()
+                await asyncio.sleep(0.01)
 
-                while time.time() - calib_start < 3.5:
-                    data = self.tactile.collect_one_frame()
-                    if data is not None:
-                        # 【神级细节】：前 1.5 秒机械臂刚启动时的震动数据被丢弃，只取后 2 秒的平滑数据
-                        if time.time() - calib_start > 1.5:
-                            calibration_scores.append(data['force_val'])
-                        self.tactile.visualize()
-                    await asyncio.sleep(0.01)
+            if len(calibration_scores) > 10:
+                self.tactile.baseline_score = np.mean(calibration_scores)
+            else:
+                self.tactile.baseline_score = 0.0
 
-                if len(calibration_scores) > 10:
-                    self.tactile.baseline_score = np.mean(calibration_scores)
-                else:
-                    self.tactile.baseline_score = 0.0
+            self.tactile.score_history.clear()
+            th = CONFIG.get('collision_detection', {}).get('force_threshold', 1.0)
 
-                self.tactile.score_history.clear()
-                th = CONFIG.get('collision_detection', {}).get('force_threshold', 1.0)
+            logger.info(f">>> 动态基准锁定为: {self.tactile.baseline_score:.1f} | 触发阈值: ±{th:.1f}")
+            logger.info(">>> 监测正式开始，等待气球爆破扰动信号...")
 
-                logger.info(f">>> 动态基准锁定为: {self.tactile.baseline_score:.1f} | 触发阈值: ±{th:.1f}")
-                logger.info(">>> 监测正式开始，等待气球爆破扰动信号...")
+            # 4. 带超时的运动监测
+            triggered = await self.monitor_collision_loop_with_timeout(timeout=10.0)
 
-                # 4. 带超时的运动监测
-                triggered = await self.monitor_collision_loop_with_timeout(timeout=10.0)
+            # 5. 触发联动避让
+            if triggered:
+                logger.warning(">>> [4/5] ⚠️ 检测触碰到气球！立即打断移动，执行避险动作...")
 
-                # 5. 触发联动避让
-                if triggered:
-                    logger.warning(">>> [4/5] ⚠️ 检测触碰到气球！立即打断移动，执行避险动作...")
+                # 🛑
+                self.arm.stop_move()
 
-                    # 🛑 【核心修复】：第一秒内必须下达急停指令！不让机械臂往前再顶哪怕一毫米！
-                    self.arm.stop_move()
+                # await self.hand.release()
 
-                    # 动作 A：然后再慢条斯理地松开手爪释放残渣
-                    await self.hand.release()
+                # 调用 YAML 配置的后退距离和速度
+                await self.arm.emergency_retreat_backward(distance=ret_dist, speed=ret_spd)
+                self.tactile.baseline_score = 0.0
 
-                    # 调用 YAML 配置的后退距离和速度
-                    await self.arm.emergency_retreat_backward(distance=ret_dist, speed=ret_spd)
+                logger.info(">>> [5/5] 避险后退完成，保持悬停 2 秒供观察...")
+                await asyncio.sleep(2.0)
+            else:
+                logger.info(">>> [4/5] 机械臂已到底部，未检测到气球爆炸...")
 
-                    self.tactile.baseline_score = 0.0
-
-                    logger.info(">>> [5/5] 避险后退完成，保持悬停 2 秒供观察...")
-                    await asyncio.sleep(2.0)
-                else:
-                    logger.info(">>> [4/5] 机械臂已到底部，未检测到气球爆炸...")
-
-                logger.info("--- 本轮循环结束，准备回归原点并重试 ---\n")
-                await asyncio.sleep(1.0)
+            # logger.info("--- 本轮循环结束，准备回归原点并重试 ---\n")
+            await asyncio.sleep(1.0)
 
         except KeyboardInterrupt:
             logger.info("\n检测到退出指令，正在终止程序...")
@@ -240,7 +248,7 @@ class IntegratedGraspController(TactileGraspController):
         """新增带超时机制的监测循环，防止没碰到气球导致一直卡住"""
         start_time = time.time()
         last_print = time.time()
-        th = CONFIG['collision_detection']['force_threshold']
+        # th = CONFIG['collision_detection']['force_threshold']
 
         while time.time() - start_time < timeout:
             data = self.tactile.collect_one_frame()
