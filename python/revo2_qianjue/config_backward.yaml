@@ -1,0 +1,25 @@
+# 触觉传感器配置
+tactile:
+  sensor_serial: "BM000028"
+  target_fps: 30
+
+# 碰撞检测配置
+collision_detection:
+  force_threshold: 0.2       # 触发后退的力阈值
+  smoothing_window: 3        # 平滑窗口
+
+# 手部控制配置
+hand_control:
+  control_duration: 1000
+
+# 机械臂联动配置 (柔顺退让版)
+arm_control:
+  arm_ip: "192.168.1.19"
+  arm_port: 8080
+  retreat_speed: 10          # 【关键】后退的滑动速度，设为10%比较缓慢柔和，像被气球推着走
+  return_speed: 20           # 回到初始位置的速度
+  max_retreat_distance: 0.10 # 一次性允许往后滑行的最大距离 (30cm防止撞底座)
+  step_retreat_distance: 0.05 # 每次受到扰动后，单次向后步进的距离（单位：米，0.05 即 5cm）
+
+  # 靠前的初始原点 (程序启动后会立刻前往这里等待气球)
+  home_joint_angles: [-1.251, 16.832, 64.087, 0.439, -83.345, -1.024]

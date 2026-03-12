@@ -10,6 +10,7 @@ import sys
 import argparse
 from pathlib import Path
 import numpy as np
+import yaml
 
 # 导入原有环境与配置
 sys.path.insert(0, str(Path(__file__).parent.parent))

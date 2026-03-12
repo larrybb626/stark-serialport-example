@@ -25,11 +25,11 @@ monitoring:
 
 # 机械臂联动配置
 arm_control:
-  arm_ip: "192.168.1.18"      # 机械臂IP地址
+  arm_ip: "192.168.1.19"      # 机械臂IP地址
   arm_port: 8080              # 控制端口
   forward_distance: 0.20      # 前进冲锋的距离 (单位：米，0.10 = 10cm)
   retreat_distance: 0.10      # 触发后退的距离 (单位：米)
   forward_speed: 5           # 前进速度 (百分比 1-100，建议慢一点)
   retreat_speed: 40           # 避险后退速度 (百分比 1-100，建议快一点)
   return_speed: 20            # 回归原点速度 (百分比 1-100)
-  home_joint_angles: [-1.215, -25.317, 107.572, 0.429, -83.081, 29.945]
+  home_joint_angles: [-1.215, -25.317, 107.572, 0.429, -83.081, -1.024]

@@ -47,7 +47,7 @@ from revo2_utils import open_modbus_revo2
 
 
 # ==================== 加载配置 ====================
-config_file = Path(__file__).parent / "config.yaml"
+config_file = Path(__file__).parent / "config_needle.yaml"
 if not config_file.exists():
     CONFIG = {
         'collision_detection': {'force_threshold': 80.0, 'smoothing_window': 3}, # 窗口稍微调小一点，反应更快
