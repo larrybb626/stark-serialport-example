@@ -1,0 +1,4 @@
+# 综合 Demo 引导配置
+# 仅指定需要加载的子配置文件路径，避免参数重复定义
+needle_config: "config_needle.yaml"
+backward_config: "config_backward.yaml"
