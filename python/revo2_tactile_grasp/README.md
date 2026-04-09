@@ -46,3 +46,44 @@ cd revo2_tactile_grasp
 # 运行示例
 (py310) ➜  python git:(main) ✗ python main.py
 ```
+
+---
+
+## 视触觉纹理识别 Demo（离线）
+
+新增 `texture_recognition_demo.py`，提供两种可离线部署的纹理识别流程：
+
+1. **Paper1 适配**：统计特征 + 2D Haar(db1)小波 + `SVM/ANN`
+2. **Paper2 适配**：`64x64` 灰度图直接 Flatten 输入 `MLP(256,128,128)`
+
+### 数据索引格式
+
+使用 `dataset_index.json` 管理样本，最小字段如下：
+
+- `image_path`: 图像路径（支持相对 `dataset_index.json` 的路径）
+- `label_id`: 数值标签
+- `split`: `train` / `val` / `test`
+
+### 典型调用
+
+```python
+from texture_recognition_demo import (
+    create_dataloader,
+    build_paths_and_labels_from_index,
+    train_paper1_models,
+    infer_paper1,
+    train_paper2_mlp,
+    infer_paper2_mlp,
+)
+
+# ---- Paper1: 特征工程 + 机器学习 ----
+train_paths, train_labels = build_paths_and_labels_from_index("dataset_index.json", "train")
+train_paper1_models(train_paths, train_labels)
+pred = infer_paper1("./demo.png", model_path="texture_ann.pkl")
+
+# ---- Paper2: 端到端 MLP ----
+train_loader = create_dataloader("dataset_index.json", split="train", batch_size=32, shuffle=True)
+val_loader = create_dataloader("dataset_index.json", split="val", batch_size=32, shuffle=False)
+train_paper2_mlp(train_loader, val_loader, num_classes=4, model_path="paper2_mlp_weights.pth")
+pred2 = infer_paper2_mlp("./demo.png", model_path="paper2_mlp_weights.pth", num_classes=4)
+```
