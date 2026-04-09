@@ -129,7 +129,13 @@ class TactileDataCollector:
         """显示深度热力图 (移除绿框)"""
         if self.display_img is None:
             return True
+
         try:
+            # 容错处理：确保传给热力图的是单通道灰度图，防止切换阶段时报错
+            gray_img = self.display_img
+            if len(gray_img.shape) == 3:
+                gray_img = cv2.cvtColor(gray_img, cv2.COLOR_BGR2GRAY)
+
             # 应用伪彩色，颜色越红代表受力越深
             display_color = cv2.applyColorMap(self.display_img, cv2.COLORMAP_JET)
 
@@ -144,7 +150,15 @@ class TactileDataCollector:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
             cv2.imshow("Tactile Depth Stream", display_color)
-            if (cv2.waitKey(1) & 0xFF) == ord('q'):
+
+            # 🌟 安全退出检测：按下 'q' 键时强制清理硬件
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == 27:
+                from common_imports import logger
+                logger.warning("\n>>> 🛑 检测到用户退出指令 (Q)，正在强制释放硬件资源...")
+                # 显式释放传感器资源，彻底解决下次运行时的 init camera fail 报错
+                if hasattr(self, 'cleanup'):
+                    self.cleanup()
                 return False
         except Exception as e:
             logger.debug(f"可视化异常: {e}")

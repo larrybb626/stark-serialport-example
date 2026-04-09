@@ -1,6 +1,7 @@
 """
 触觉仿生手 + 机械臂：气球主动推针（单次扰动步进后退版）Demo
 """
+import collections
 
 import asyncio
 import time
@@ -29,28 +30,101 @@ import cv2
 
 # ==================== 触觉采集模块 (Difference 特化版) ====================
 class DiffTactileDataCollector(TactileDataCollector):
-    """继承原有的采集器，强制改为采集 Difference (差异) 数据以提高鲁棒性"""
+    """底层使用 Difference 保证退让稳定，前端展示 Depth 热力图 + XYZ 平滑曲线"""
+    def __init__(self, sensor_serial=None):
+        super().__init__(sensor_serial)
+
+        # ====== XYZ 曲线的数据队列 ======
+        self.plot_history_len = 150
+        self.force_x_hist = collections.deque([0.0]*self.plot_history_len, maxlen=self.plot_history_len)
+        self.force_y_hist = collections.deque([0.0]*self.plot_history_len, maxlen=self.plot_history_len)
+        self.force_z_hist = collections.deque([0.0]*self.plot_history_len, maxlen=self.plot_history_len)
+
+        # 用于 EMA 平滑滤波的历史变量
+        self.smooth_fx = 0.0
+        self.smooth_fy = 0.0
+        self.smooth_fz = 0.0
+
+    def draw_force_curves(self, target_h):
+        plot_w = 400
+        canvas = np.full((target_h, plot_w, 3), 30, dtype=np.uint8)
+        hists = [self.force_x_hist, self.force_y_hist, self.force_z_hist]
+        colors = [(0, 0, 255), (0, 255, 0), (255, 100, 100)] # BGR: 红, 绿, 浅蓝
+        titles = ['Force X', 'Force Y', 'Force Z']
+        strip_h = target_h // 3
+
+        for i in range(3):
+            y_offset = i * strip_h
+            hist = list(hists[i])
+            cv2.rectangle(canvas, (0, y_offset), (plot_w-1, y_offset + strip_h - 1), (100, 100, 100), 1)
+            cv2.putText(canvas, titles[i], (10, y_offset + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors[i], 1, cv2.LINE_AA)
+
+            min_v, max_v = min(hist), max(hist)
+
+            # 强制最小 Y 轴跨度为 2.0，避免微小底噪被无限放大拉伸
+            rng = max(max_v - min_v, 2.0)
+
+            pts = []
+            for x_idx, val in enumerate(hist):
+                px = int((x_idx / self.plot_history_len) * plot_w)
+                norm_v = (val - min_v) / rng
+                py = y_offset + strip_h - 15 - int(norm_v * (strip_h - 30))
+                pts.append((px, py))
+
+            pts_arr = np.array(pts, np.int32).reshape((-1, 1, 2))
+            cv2.polylines(canvas, [pts_arr], False, colors[i], 2, cv2.LINE_AA)
+        return canvas
 
     def collect_one_frame(self):
         if not self.sensor: return None
         try:
-            # 1. 获取 BGR 格式的差分图，shape=(700, 400, 3)
+            # 1. 提取 3D 力学数据用于画 XYZ 曲线
+            fx, fy, fz = 0.0, 0.0, 0.0
+            try:
+                diff,raw_force = self.sensor.selectSensorInfo(Sensor.OutputType.Difference, Sensor.OutputType.Force3DTuned)
+                if raw_force is not None:
+                    if len(raw_force.shape) == 3:
+                        fx, fy, fz = np.mean(raw_force, axis=(0, 1))
+                    else:
+                        fx, fy, fz = raw_force[0], raw_force[1], raw_force[2]
+            except Exception:
+                pass
+
+            # 指数移动平均 (EMA) 低通滤波，消除曲线的剧烈毛刺
+            self.smooth_fx = 0.7 * self.smooth_fx + 0.3 * fx
+            self.smooth_fy = 0.7 * self.smooth_fy + 0.3 * fy
+            self.smooth_fz = 0.7 * self.smooth_fz + 0.3 * fz
+
+            self.force_x_hist.append(self.smooth_fx)
+            self.force_y_hist.append(self.smooth_fy)
+            self.force_z_hist.append(self.smooth_fz)
+
+            # 2. 读取 Difference 用于计算实际的控制得分 (保障后退逻辑的完美运行)
             raw_diff = self.sensor.selectSensorInfo(Sensor.OutputType.Difference)
             if raw_diff is None: return None
-
-            # 2. 直接转为单通道灰度图来计算全图的受力平均值，绝不要再乘以 200！
             diff_gray = cv2.cvtColor(raw_diff, cv2.COLOR_BGR2GRAY)
             current_score = float(np.mean(diff_gray))
 
-            # 3. 画面显示依然保留彩色原始图，方便你观察
-            self.display_img = raw_diff
+            # 3. 提取 Depth 图像，并渲染为深蓝色热力图 (仅作视觉展示用)
+            raw_depth = self.sensor.selectSensorInfo(Sensor.OutputType.Depth)
+            if raw_depth is not None:
+                depth_vis = np.clip(raw_depth * 200, 0, 255).astype(np.uint8)
+                base_heatmap = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+            else:
+                base_heatmap = raw_diff # 容错兜底
+
+            # 4. 画面无缝拼接 (左：深蓝热力图，右：XYZ平滑曲线)
+            h, w, _ = base_heatmap.shape
+            curves_canvas = self.draw_force_curves(target_h=h)
+            self.display_img = np.hstack([base_heatmap, curves_canvas])
 
             return {
                 'force_val': current_score,
                 'timestamp': time.time()
             }
+
         except Exception as e:
-            logger.error(f"采集触觉 Difference 数据异常: {e}")
+            logger.error(f"采集触觉数据异常: {e}")
             return None
 
 

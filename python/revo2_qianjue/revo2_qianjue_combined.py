@@ -1,7 +1,8 @@
 """
 触觉仿生手 + 机械臂：【扎破气球 -> 战术反弹 -> 原点复位 -> 柔顺退让】 全新综合连招 Demo
 """
-
+import atexit
+import collections
 import asyncio
 import time
 import sys
@@ -46,39 +47,141 @@ class SwitchableTactileCollector(TactileDataCollector):
     """全局统一持有相机资源，但支持根据阶段切换 Depth 和 Difference 模式"""
     def __init__(self, sensor_serial=None):
         super().__init__(sensor_serial)
-        self.use_diff = False  # 默认为 False，即使用原版 Depth 模式
+        self.use_diff = False  # 默认为 False，代表 Phase 1
+
+        # ====== XYZ 曲线的数据队列 ======
+        self.plot_history_len = 150
+        self.force_x_hist = collections.deque([0.0]*self.plot_history_len, maxlen=self.plot_history_len)
+        self.force_y_hist = collections.deque([0.0]*self.plot_history_len, maxlen=self.plot_history_len)
+        self.force_z_hist = collections.deque([0.0]*self.plot_history_len, maxlen=self.plot_history_len)
+
+        # 🌟 修复 2：用于 EMA 平滑滤波的历史变量
+        self.smooth_fx = 0.0
+        self.smooth_fy = 0.0
+        self.smooth_fz = 0.0
+
+    def draw_force_curves(self, target_h):
+        """辅助方法：在右侧绘制三行横向 XYZ 曲线图"""
+        plot_w = 400  # 右侧曲线图的固定宽度
+        # 创建深色背景画板 (BGR: 30,30,30)
+        canvas = np.full((target_h, plot_w, 3), 30, dtype=np.uint8)
+
+        # 这里的数据来源假设你类中已有 force_x_hist 等 deque 队列
+        # 如果没有，请确保在类的 __init__ 中初始化它们
+        hists = [getattr(self, 'force_x_hist', [0]*150),
+                 getattr(self, 'force_y_hist', [0]*150),
+                 getattr(self, 'force_z_hist', [0]*150)]
+        colors = [(0, 0, 255), (0, 255, 0), (255, 100, 100)] # BGR: 红, 绿, 浅蓝
+        titles = ['Force X', 'Force Y', 'Force Z']
+        strip_h = target_h // 3  # 将画板高度三等分
+
+        for i in range(3):
+            y_offset = i * strip_h
+            hist = list(hists[i])
+
+            # 画每个条带的边框和标题
+            cv2.rectangle(canvas, (0, y_offset), (plot_w-1, y_offset + strip_h - 1), (100, 100, 100), 1)
+            cv2.putText(canvas, titles[i], (10, y_offset + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors[i], 1, cv2.LINE_AA)
+
+            # 缩放逻辑：强制最小跨度为 2.0，防止微小噪声被拉伸成陡峭曲线
+            min_v, max_v = min(hist), max(hist)
+            rng = max(max_v - min_v, 2.0)
+
+            pts = []
+            for x_idx, val in enumerate(hist):
+                px = int((x_idx / len(hist)) * plot_w)
+                # Y轴坐标映射 (反转Y轴使得正值朝上)
+                norm_v = (val - min_v) / rng
+                py = y_offset + strip_h - 15 - int(norm_v * (strip_h - 30))
+                pts.append((px, py))
+
+            if len(pts) > 1:
+                pts_arr = np.array(pts, np.int32).reshape((-1, 1, 2))
+                cv2.polylines(canvas, [pts_arr], False, colors[i], 2, cv2.LINE_AA)
+        return canvas
 
     def collect_one_frame(self):
         if not self.sensor: return None
         try:
-            # 🌟 核心修改：无论处于哪个阶段，我们都提取 Depth 图像用于显示
-            # 这样就能保证 OpenCV 窗口从头到尾都是同一种蓝色的视觉风格
-            raw_depth = self.sensor.selectSensorInfo(Sensor.OutputType.Depth)
-            depth_vis = None
-            if raw_depth is not None:
-                depth_vis = np.clip(raw_depth * 200, 0, 255).astype(np.uint8)
+            # ========================================================
+            # 不管原文件用的是 Depth 还是 ImgObjEnhance，直接继承调用
+            # ========================================================
+            parent_data = super().collect_one_frame()
+            if parent_data is None: return None
 
+            # ========================================================
+            # 2. 如果处于 Phase 2，拦截得分并替换为 Difference 的分数
+            # ========================================================
             if self.use_diff:
-                # ====== Phase 2: Difference 模式 ======
-                raw_diff = self.sensor.selectSensorInfo(Sensor.OutputType.Difference)
-                if raw_diff is None: return None
-                diff_gray = cv2.cvtColor(raw_diff, cv2.COLOR_BGR2GRAY)
-                current_score = float(np.mean(diff_gray))
+                try:
+                    raw_diff = self.sensor.selectSensorInfo(Sensor.OutputType.Difference)
+                    if raw_diff is not None:
+                        diff_gray = cv2.cvtColor(raw_diff, cv2.COLOR_BGR2GRAY)
+                        parent_data['force_val'] = float(np.mean(diff_gray))
+                except Exception as e:
+                    logger.error(f"提取 Difference 异常: {e}")
 
-                # 显示画面使用 Depth (障眼法)
-                self.display_img = depth_vis if depth_vis is not None else raw_diff
-            else:
-                # ====== Phase 1: 完美复原原版 Depth 模式 ======
-                raw_depth = self.sensor.selectSensorInfo(Sensor.OutputType.Depth)
-                if raw_depth is None: return None
-                depth_vis = np.clip(raw_depth * 200, 0, 255).astype(np.uint8)
-                current_score = float(np.mean(depth_vis))
-                self.display_img = depth_vis
+            # ========================================================
+            # 3. 提取 3D 力学数据用于画 XYZ 曲线
+            # ========================================================
+            fx, fy, fz = 0.0, 0.0, 0.0
+            try:
+                diff,raw_force = self.sensor.selectSensorInfo(Sensor.OutputType.Difference,Sensor.OutputType.Force3DTuned)
+                if raw_force is not None:
+                    if len(raw_force.shape) == 3:
+                        fx, fy, fz = np.mean(raw_force, axis=(0, 1))
+                    else:
+                        fx, fy, fz = raw_force[0], raw_force[1], raw_force[2]
+            except Exception:
+                pass
 
-            return {'force_val': current_score, 'timestamp': time.time()}
+            # 🌟 修复 2 续：指数移动平均 (EMA) 低通滤波
+            # 新值只占 30% 权重，70% 继承老状态，极大滤除了高频毛刺
+            self.smooth_fx = 0.7 * self.smooth_fx + 0.3 * fx
+            self.smooth_fy = 0.7 * self.smooth_fy + 0.3 * fy
+            self.smooth_fz = 0.7 * self.smooth_fz + 0.3 * fz
+
+            self.force_x_hist.append(self.smooth_fx)
+            self.force_y_hist.append(self.smooth_fy)
+            self.force_z_hist.append(self.smooth_fz)
+
+            # 4. 画面无缝拼接
+            if hasattr(self, 'display_img') and self.display_img is not None:
+                # 确保底图是 3 通道彩色图 (如果父类吐出来是单通道灰度，自动转换)
+                if len(self.display_img.shape) == 2:
+                    base_img = cv2.cvtColor(self.display_img, cv2.COLOR_GRAY2BGR)
+                else:
+                    base_img = self.display_img
+
+                h, w, _ = base_img.shape
+                curves_canvas = self.draw_force_curves(target_h=h)
+
+                # 把曲线拼接在右边，并覆盖回 display_img
+                self.display_img = np.hstack([base_img, curves_canvas])
+
+            return parent_data
+
         except Exception as e:
             logger.error(f"采集触觉数据异常: {e}")
             return None
+
+    def cleanup(self):
+        """极度安全的清理函数，不管 SDK 内部什么状态都强行释放"""
+        try:
+            if hasattr(self, 'sensor') and self.sensor is not None:
+                # 强行释放底层的 C++ 指针，并忽略它自己的报错
+                try:
+                    self.sensor.release()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 调用父类的清理（通常包含关窗口等）
+        try:
+            super().cleanup()
+        except Exception:
+            pass
 
 class UnifiedArmController:
     """一个包含所有动作的综合机械臂控制器"""
@@ -177,16 +280,19 @@ class MasterDemoController:
                 hit_success = await self.execute_phase1(p1_cfg, CFG_PHASE1['collision_detection']['force_threshold'])
 
                 # ==================== 完美复位衔接 ====================
+                # if True:
                 if hit_success:
                     logger.info(">>> [衔接] 扎破气球并已战术后退。保持镜头感 2 秒...")
-                    await asyncio.sleep(5.0)
+                    await asyncio.sleep(2.0)
 
-                    logger.info(">>> [衔接] 正在将机械臂安全复位到 Phase 2 发车点...")
-                    # 切换到 Backward 的坐标
+                    # 🌟 核心修改：删除了所有 return_to_home 的代码！
+                    logger.info(">>> [衔接] 机械臂原地待命，直接无缝切入 Phase 2...")
+
+                    # 只需要拿一下 Phase 2 的参数传进去即可
                     p2_cfg = CFG_PHASE2['arm_control']
-                    self.arm.set_home_joint(p2_cfg['home_joint_angles'])
-                    await self.arm.return_to_home(p2_cfg['return_speed'])
-                    await asyncio.sleep(1.0)
+                    # self.arm.set_home_joint(p2_cfg['home_joint_angles'])
+                    # await self.arm.return_to_home(p2_cfg['return_speed'])
+                    # await asyncio.sleep(1.0)
 
                     # ==================== Phase 2：被动柔顺 ====================
                     logger.info("\n" + "="*30 + " 【Phase 2：连续柔顺跟随】 " + "="*30)
@@ -367,13 +473,41 @@ async def main():
     await hand.initialize()
 
     tactile = SwitchableTactileCollector(serial)
-    if not tactile.initialize(): sys.exit(1)
+
+    # 🌟 核心保底机制：注册操作系统的退出钩子
+    # 无论程序是怎么死的，系统在回收 Python 进程前都必会执行这个函数！
+    def force_release_camera():
+        print("\n[系统守护] 监测到程序退出，正在强制释放 Xense 触觉相机资源...")
+        try:
+            tactile.cleanup()
+        except:
+            pass
+
+    atexit.register(force_release_camera)
+
+    # 如果这里初始化失败了，退出钩子也能保证不会抛 NoneType 异常
+    if not tactile.initialize():
+        sys.exit(1)
 
     arm = UnifiedArmController(ip, port)
 
     # 载入状态机并启动
     controller = MasterDemoController(hand, tactile, arm)
-    await controller.run_full_sequence()
+
+    try:
+        await controller.run_full_sequence()
+    except BaseException as e:
+        # BaseException 能抓住除了拔电源以外的几乎所有强杀指令（包括 Ctrl+C 和 SystemExit）
+        logger.warning(f"\n⚠️ 程序被强制中断或发生严重错误: {e}")
+    finally:
+        logger.info(">>> 正在执行硬件安全断开流程...")
+        try:
+            await controller.cleanup()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[系统退出] 用户手动中止 (Ctrl+C)。")
