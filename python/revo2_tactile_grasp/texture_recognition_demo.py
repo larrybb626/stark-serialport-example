@@ -46,14 +46,33 @@ def _load_grayscale_image(image_path: str) -> np.ndarray:
 
 def _resize_to_tensor(image: np.ndarray, image_size: Tuple[int, int]) -> torch.Tensor:
     """将灰度图 resize 到目标尺寸，并转成 [1, H, W] 的 float Tensor(0~1)。"""
-    tensor = torch.from_numpy(image).float().unsqueeze(0).unsqueeze(0) / 255.0
-    resized = F.interpolate(
-        tensor,
-        size=image_size,
-        mode="bilinear",
-        align_corners=False,
-    )
-    return resized.squeeze(0)
+    resized = _resize_grayscale_array(image, image_size)
+    return torch.from_numpy(resized).float().unsqueeze(0) / 255.0
+
+
+def _resize_grayscale_array(image: np.ndarray, image_size: Tuple[int, int]) -> np.ndarray:
+    """将 uint8 灰度图 resize 到目标尺寸，优先 PIL/OpenCV，最后回退 Torch。"""
+    height, width = image_size
+    try:
+        from PIL import Image
+
+        pil_image = Image.fromarray(image, mode="L")
+        resized = pil_image.resize((width, height), resample=Image.BILINEAR)
+        return np.asarray(resized, dtype=np.uint8)
+    except Exception:
+        pass
+
+    try:
+        import cv2
+
+        resized = cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
+        return resized.astype(np.uint8)
+    except Exception:
+        pass
+
+    tensor = torch.from_numpy(image).float().unsqueeze(0).unsqueeze(0)
+    resized = F.interpolate(tensor, size=(height, width), mode="bilinear", align_corners=False)
+    return resized.squeeze(0).squeeze(0).clamp(0, 255).to(torch.uint8).cpu().numpy()
 
 
 def _resolve_image_path(index_path: str, image_path: str) -> str:
@@ -144,8 +163,7 @@ def _haar_dwt2(roi: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.
 def extract_paper1_features(image_path: str, roi_size: Tuple[int, int] = (128, 128)) -> List[float]:
     """提取论文1适配特征：方差/偏度/峰度 + DWT 能量。"""
     image = _load_grayscale_image(image_path)
-    roi = _resize_to_tensor(image, roi_size).squeeze(0).numpy()
-    roi = (roi * 255.0).astype(np.float32)
+    roi = _resize_grayscale_array(image, roi_size).astype(np.float32)
 
     flattened = roi.reshape(-1)
 
