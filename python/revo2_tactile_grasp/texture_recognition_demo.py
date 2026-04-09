@@ -255,9 +255,9 @@ def train_paper2_mlp(
 
     best_val_acc = 0.0
     best_state = None
-    val_acc_history: List[float] = []
+    val_acc_history: List[Dict[str, Any]] = []
 
-    for _ in range(epochs):
+    for epoch in range(epochs):
         model.train()
         for images, labels in train_loader:
             images = images.to(device)
@@ -270,7 +270,7 @@ def train_paper2_mlp(
             optimizer.step()
 
         val_acc = evaluate_paper2_mlp(model, val_loader, device=device)
-        val_acc_history.append(val_acc)
+        val_acc_history.append({"epoch": epoch + 1, "val_acc": float(val_acc)})
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
