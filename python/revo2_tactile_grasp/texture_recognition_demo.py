@@ -253,8 +253,9 @@ def train_paper2_mlp(
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    best_val_acc = -1.0
+    best_val_acc = 0.0
     best_state = None
+    val_acc_history: List[float] = []
 
     for _ in range(epochs):
         model.train()
@@ -269,7 +270,8 @@ def train_paper2_mlp(
             optimizer.step()
 
         val_acc = evaluate_paper2_mlp(model, val_loader, device=device)
-        if val_acc > best_val_acc:
+        val_acc_history.append(val_acc)
+        if val_acc >= best_val_acc:
             best_val_acc = val_acc
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
@@ -279,7 +281,7 @@ def train_paper2_mlp(
     else:
         torch.save(model.state_dict(), model_path)
 
-    return {"model": model, "best_val_acc": best_val_acc}
+    return {"model": model, "best_val_acc": best_val_acc, "val_acc_history": val_acc_history}
 
 
 def infer_paper2_mlp(
@@ -293,7 +295,7 @@ def infer_paper2_mlp(
     image_tensor = _resize_to_tensor(image, image_size).unsqueeze(0).to(device)
 
     model = Paper2MLP(num_classes=num_classes, image_size=image_size).to(device)
-    state_dict = torch.load(model_path, map_location=device)
+    state_dict = torch.load(model_path, map_location=device, weights_only=True)
     model.load_state_dict(state_dict)
     model.eval()
 
