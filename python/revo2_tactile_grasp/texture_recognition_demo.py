@@ -235,8 +235,8 @@ def evaluate_paper2_mlp(model: nn.Module, data_loader: DataLoader, device: str =
             labels = labels.to(device)
             logits = model(images)
             preds = torch.argmax(logits, dim=1)
-            correct += int((preds == labels).sum().item())
-            total += int(labels.size(0))
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
     return float(correct / total) if total > 0 else 0.0
 
 
@@ -270,7 +270,7 @@ def train_paper2_mlp(
             optimizer.step()
 
         val_acc = evaluate_paper2_mlp(model, val_loader, device=device)
-        val_acc_history.append({"epoch": epoch + 1, "val_acc": float(val_acc)})
+        val_acc_history.append({"epoch": epoch + 1, "val_acc": val_acc})
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
